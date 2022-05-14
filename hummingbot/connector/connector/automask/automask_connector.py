@@ -44,8 +44,8 @@ class AutomaskConnector(ConnectorBase):
     AutomaskInFlightOrder connects with automask gateway APIs and provides pricing, user account tracking and trading
     functionality.
     """
-    API_CALL_TIMEOUT = 10.0
-    POLL_INTERVAL = 60.0
+    API_CALL_TIMEOUT = 60.0 # seconds
+    POLL_INTERVAL = 60.0 # seconds
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -68,7 +68,8 @@ class AutomaskConnector(ConnectorBase):
         self._automask_wallet_address = automask_wallet_address
         self._automask_wallet_seeds = automask_wallet_seeds
         self._trading_pairs = trading_pairs
-        self._trading_required = trading_required
+        #FIXME:
+        self._trading_required = True
         self._ev_loop = asyncio.get_event_loop()
         self._shared_client = None
         self._last_poll_timestamp = 0.0
@@ -82,10 +83,17 @@ class AutomaskConnector(ConnectorBase):
         return "automask"
 
     @staticmethod
+    #@async_ttl_cache(ttl=3600, maxsize=1000)
     async def fetch_trading_pairs() -> List[str]:
-        return ["LUNA-UST", "LUNA-KRT", "LUNA-SDT", "LUNA-MNT",
-                "UST-KRT", "UST-SDT", "UST-MNT",
-                "KRT-SDT", "KRT-MNT", "SDT-MNT"]
+        #TODO:
+        return ["blocto__FLOW-blocto__USDC"]
+    @staticmethod
+    def _analyzed_token_pair(trading_pair):
+        base_all, quote_all = trading_pair.split("-")
+        dapp_name, base = base_all.split("__")
+        _, quote = quote_all.split("__")
+        return dapp_name, base, quote
+
 
     @property
     def limit_orders(self) -> List[LimitOrder]:
@@ -94,7 +102,8 @@ class AutomaskConnector(ConnectorBase):
             for in_flight_order in self._in_flight_orders.values()
         ]
 
-    @async_ttl_cache(ttl=2, maxsize=10)
+    #FIXME: timeout more 
+    @async_ttl_cache(ttl=30, maxsize=1000)
     async def get_quote_price(self, trading_pair: str, is_buy: bool, amount: Decimal) -> Optional[Decimal]:
         """
         Retrieves a quote price.
@@ -104,17 +113,29 @@ class AutomaskConnector(ConnectorBase):
         :return: The quote price.
         """
 
-        try:
+        self.logger().info('get_quote_price.....')
 
-            base, quote = trading_pair.split("-")
+        try:
+            #TODO: Change API
+            # dappName=blocto  srcTokenAddr=FLOW  tgtTokenAddr=USDC  srcTokenAmount=1000
+            dapp_name, base, quote = self._analyzed_token_pair(trading_pair)
             side = "buy" if is_buy else "sell"
-            resp = await self._api_request("post", "terra/price", {"base": base, "quote": quote, "side": side,
-                                                                   "amount": str(amount)})
-            txFee = resp["txFee"] / float(amount)
-            price_with_txfee = resp["price"] + txFee if is_buy else resp["price"] - txFee
-            return Decimal(str(price_with_txfee))
-            # if resp["price"] is not None:
-            #     return Decimal(str(resp["price"]))
+
+            resp = await self._api_request("get", "cross_chain_price_cache", {
+                "dappName": dapp_name,
+                "srcTokenAddr": base,
+                "tgtTokenAddr": quote,
+                "srcTokenAmount": str(amount)
+            })
+
+            if not resp["success"]:
+                raise 
+
+            # FIXME: here change back to single Quote price, need to care about how many dot
+            buy_price = Decimal(str(resp["result"]["reverseTgtAmount"] / float(amount) ))
+            sell_price = Decimal(str(resp["result"]["tgtAmount"]  / float(amount) ))
+
+            return buy_price if is_buy else sell_price
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -183,7 +204,7 @@ class AutomaskConnector(ConnectorBase):
 
         amount = self.quantize_order_amount(trading_pair, amount)
         price = self.quantize_order_price(trading_pair, price)
-        base, quote = trading_pair.split("-")
+        dapp_name, base, quote = self._analyzed_token_pair(trading_pair)
         api_params = {"base": base,
                       "quote": quote,
                       "side": "buy" if trade_type is TradeType.BUY else "sell",
@@ -193,6 +214,27 @@ class AutomaskConnector(ConnectorBase):
                       }
         self.start_tracking_order(order_id, None, trading_pair, trade_type, price, amount)
         try:
+            #FIXME: wrong swap api
+
+            tracked_order = self._in_flight_orders.get(order_id)
+
+            tracked_order.executed_amount_base = amount
+            tracked_order.executed_amount_quote = amount * price
+            event_tag = MarketEvent.BuyOrderCompleted if tracked_order.trade_type is TradeType.BUY \
+                else MarketEvent.SellOrderCompleted
+            event_class = BuyOrderCompletedEvent if tracked_order.trade_type is TradeType.BUY \
+                else SellOrderCompletedEvent
+            self.trigger_event(event_tag,
+                               event_class(self.current_timestamp,
+                                           tracked_order.client_order_id,
+                                           tracked_order.base_asset,
+                                           tracked_order.quote_asset,
+                                           tracked_order.executed_amount_base,
+                                           tracked_order.executed_amount_quote,
+                                           tracked_order.order_type))
+            return
+
+            #TODO: change the API
             order_result = await self._api_request("post", "terra/trade", api_params)
             hash = order_result["txHash"]
             txSuccess = order_result["txSuccess"]
@@ -307,6 +349,8 @@ class AutomaskConnector(ConnectorBase):
     @property
     def status_dict(self) -> Dict[str, bool]:
         return {
+            ##FIXME:
+            #"account_balance": True,
             "account_balance": len(self._account_balances) > 0 if self._trading_required else True,
             # "allowances": self.has_allowances() if self._trading_required else True
         }
@@ -323,7 +367,7 @@ class AutomaskConnector(ConnectorBase):
     async def check_network(self) -> NetworkStatus:
         try:
             response = await self._api_request("get", "api")
-            if response["status"] != "ok":
+            if response["result"]["status"] != "ok":
                 raise Exception(f"Error connecting to Gateway API. HTTP status is {response.status}.")
         except asyncio.CancelledError:
             raise
@@ -362,11 +406,24 @@ class AutomaskConnector(ConnectorBase):
         """
         Calls Eth API to update total and available balances.
         """
+
+        #FIXME:
+        self.logger().info('Upldate balances....')
+
         local_asset_names = set(self._account_balances.keys())
         remote_asset_names = set()
-        resp_json = await self._api_request("post",
-                                            "terra/balances",
-                                            {"address": self._automask_wallet_address})
+        #TODO: Update wallet balances
+        # resp_json = await self._api_request("post",
+        #                                     "terra/balances",
+        #                                     {"address": self._automask_wallet_address})
+        resp_json = {}
+        resp_json["balances"] = {
+            'blocto__FLOW': Decimal(str(100000)),
+            'blocto__USDT': Decimal(str(100000)),
+            'blocto__USDC': Decimal(str(100000)),
+            'blocto__BUSD': Decimal(str(100000)),
+        }
+
         for token, bal in resp_json["balances"].items():
             self._account_available_balances[token] = Decimal(str(bal))
             self._account_balances[token] = Decimal(str(bal))
@@ -385,9 +442,11 @@ class AutomaskConnector(ConnectorBase):
         :returns Shared client session instance
         """
         if self._shared_client is None:
-            ssl_ctx = ssl.create_default_context(cafile=GATEAWAY_CA_CERT_PATH)
-            ssl_ctx.load_cert_chain(GATEAWAY_CLIENT_CERT_PATH, GATEAWAY_CLIENT_KEY_PATH)
-            conn = aiohttp.TCPConnector(ssl_context=ssl_ctx)
+            #TODO: https
+            #ssl_ctx = ssl.create_default_context(cafile=GATEAWAY_CA_CERT_PATH)
+            #ssl_ctx.load_cert_chain(GATEAWAY_CLIENT_CERT_PATH, GATEAWAY_CLIENT_KEY_PATH)
+            #conn = aiohttp.TCPConnector(ssl_context=ssl_ctx)
+            conn = aiohttp.TCPConnector()
             self._shared_client = aiohttp.ClientSession(connector=conn)
         return self._shared_client
 
@@ -402,8 +461,9 @@ class AutomaskConnector(ConnectorBase):
         :param params: A dictionary of required params for the end point
         :returns A response in json format.
         """
-        base_url = f"https://{global_config_map['gateway_api_host'].value}:" \
-                   f"{global_config_map['gateway_api_port'].value}"
+
+        #TODO: change URL
+        base_url = f"http://45.56.88.225:20001"
         url = f"{base_url}/{path_url}"
         client = await self._http_client()
         if method == "get":
